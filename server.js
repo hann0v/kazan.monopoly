@@ -9,7 +9,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app);
 const io = new Server(server);
 
-const rooms = {}, timers = {};
+const rooms = {}, timers = {}, turnTimers = {};
+const TURN_MS = 30000;
 const COLORS = ['#e63946', '#2ec4b6', '#ff9f1c', '#9b5de5', '#3a86ff', '#ff70a6'];
 const rnd = n => Math.floor(Math.random() * n);
 const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = rnd(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
@@ -27,8 +28,10 @@ const log = (r, t) => { r.log.push(t); if (r.log.length > 80) r.log.shift(); };
 const fx = (r, e) => io.to(r.code).emit('fx', e);
 function sync(r) {
   r.last = Date.now();
+  armTurn(r);
   const { decks, ...v } = r;
   if (v.auction) v.auction = { ...v.auction, left: v.auction.endsAt - Date.now() };
+  v.turnLeft = r.turnEnds ? r.turnEnds - Date.now() : null;
   io.to(r.code).emit('state', v);
 }
 
@@ -43,10 +46,17 @@ function newRoom(code) {
 }
 
 // ---------- деньги и собственность ----------
+// Каждое движение денег отправляем клиентам, чтобы нарисовать перелёт золота
 function pay(r, p, amt, to) {
+  if (amt <= 0) return;
   p.money -= amt;
   if (to) to.money += amt;
   if (p.money < 0) p.debtTo = to ? to.id : null;
+  fx(r, { t: 'pay', from: p.id, to: to ? to.id : null, amount: amt });
+}
+function gain(r, p, amt) {
+  p.money += amt;
+  fx(r, { t: 'pay', from: null, to: p.id, amount: amt });
 }
 
 function give(r, i, id) {
@@ -75,7 +85,7 @@ function goJail(r, p) {
 
 function moveTo(r, p, to, passGo = true) {
   if (passGo && to < p.pos) {
-    p.money += 200;
+    gain(r, p, 200);
     log(r, `${p.name} проходит СТАРТ: +200 г`);
     fx(r, { t: 'go', who: p.id });
   }
@@ -109,7 +119,7 @@ function draw(r, p, deck) {
   log(r, `${p.name} · ${deck === 'chance' ? 'Шанс' : 'Казна'}: ${c.t}`);
   fx(r, { t: 'card', ...r.card });
   switch (c.a) {
-    case 'money': c.v > 0 ? (p.money += c.v) : pay(r, p, -c.v, null); break;
+    case 'money': c.v > 0 ? gain(r, p, c.v) : pay(r, p, -c.v, null); break;
     case 'move': moveTo(r, p, c.to); break;
     case 'back': moveTo(r, p, (p.pos + 40 - c.v) % 40, false); break;
     case 'jail': goJail(r, p); break;
@@ -147,7 +157,7 @@ function nextTurn(r) {
 function checkWin(r) {
   const a = alive(r);
   if (a.length > 1) return false;
-  clearTimeout(timers[r.code]);
+  clearTimeout(timers[r.code]); clearTimeout(turnTimers[r.code]);
   r.auction = null; r.trade = null; r.phase = 'over'; r.winner = a[0]?.id;
   if (a[0]) { log(r, `${a[0].name} побеждает!`); fx(r, { t: 'win', who: a[0].id }); }
   return true;
@@ -170,6 +180,42 @@ function bankrupt(r, p) {
   log(r, `${p.name} — банкрот${cr ? ', всё имущество уходит ' + cr.name : ''}`);
   fx(r, { t: 'bankrupt', who: p.id });
   if (!checkWin(r) && cur(r) === p) nextTurn(r);
+}
+
+// ---------- таймер хода ----------
+// На каждый шаг хода (бросок, покупка, завершение) — 30 секунд. Ключ меняется при смене шага.
+function armTurn(r) {
+  const waiting = r.started && ['roll', 'buy', 'end'].includes(r.phase);
+  const key = waiting ? `${r.turn}:${r.phase}:${r.doubles}:${cur(r).id}` : null;
+  if (key === r.tkey) return;
+  r.tkey = key;
+  clearTimeout(turnTimers[r.code]);
+  r.turnEnds = waiting ? Date.now() + TURN_MS : null;
+  if (waiting) turnTimers[r.code] = setTimeout(() => turnTimeout(r, key), TURN_MS);
+}
+
+function turnTimeout(r, key) {
+  if (rooms[r.code] !== r || r.tkey !== key) return;
+  const p = cur(r);
+  log(r, `${p.name}: время вышло, ход переходит дальше`);
+  fx(r, { t: 'timeout', who: p.id });
+  if (p.jail && r.phase === 'roll' && ++p.jailTurns >= 3) { pay(r, p, 50, null); p.jail = false; }
+  if (p.money < 0) autoRaise(r, p);
+  if (p.money < 0) bankrupt(r, p);
+  else nextTurn(r);
+  sync(r);
+}
+
+// Автоматически продаём дома (равномерно) и закладываем улицы, пока долг не погашен
+function autoRaise(r, p) {
+  const mine = () => Object.entries(r.props).filter(([, pr]) => pr.owner === p.id);
+  while (p.money < 0) {
+    const h = mine().filter(([, pr]) => pr.houses).sort((a, b) => b[1].houses - a[1].houses)[0];
+    if (h) { act(r, p, { t: 'sell', i: +h[0] }); if (h[1].houses === 5) { h[1].houses = 0; r.hotels++; gain(r, p, SQ[h[0]].house * 2.5); } continue; }
+    const m = mine().find(([, pr]) => !pr.mort);
+    if (!m) return;
+    act(r, p, { t: 'mort', i: +m[0] });
+  }
 }
 
 // ---------- аукцион ----------
@@ -302,7 +348,7 @@ function act(r, p, a) {
       if (pr.houses < Math.max(...gr.map(x => x.houses))) return 'Продавайте равномерно';
       if (pr.houses === 5) { if (r.houses < 4) return 'В банке не хватает домов, чтобы разобрать отель'; r.hotels++; r.houses -= 4; }
       else r.houses++;
-      pr.houses--; p.money += s.house / 2;
+      pr.houses--; gain(r, p, s.house / 2);
       log(r, `${p.name} продаёт постройку: ${s.name}`);
       return;
     }
@@ -310,7 +356,7 @@ function act(r, p, a) {
     case 'mort':
       if (!own || pr.mort) return;
       if (groupBuilt(r, i)) return 'Сначала продайте дома в этой группе';
-      pr.mort = true; p.money += s.price / 2;
+      pr.mort = true; gain(r, p, s.price / 2);
       log(r, `${p.name} закладывает ${s.name}`);
       return;
 
@@ -361,7 +407,7 @@ function act(r, p, a) {
       if (!a.ok) { log(r, `${p.name} отклоняет обмен`); return; }
       if (!tradeOk(r, t)) return 'Условия обмена уже невыполнимы';
       const A = P(r, t.from);
-      A.money += t.tm - t.gm; p.money += t.gm - t.tm;
+      pay(r, A, t.gm, p); pay(r, p, t.tm, A);
       t.give.forEach(j => give(r, j, p.id));
       t.get.forEach(j => give(r, j, A.id));
       log(r, `Обмен ${A.name} ⇄ ${p.name} состоялся`);
@@ -424,7 +470,7 @@ io.on('connection', s => {
 // Пустые комнаты удаляем через 2 часа простоя
 setInterval(() => {
   for (const r of Object.values(rooms))
-    if (!r.players.some(p => p.online) && Date.now() - r.last > 2 * 3600e3) { clearTimeout(timers[r.code]); delete rooms[r.code]; }
+    if (!r.players.some(p => p.online) && Date.now() - r.last > 2 * 3600e3) { clearTimeout(timers[r.code]); clearTimeout(turnTimers[r.code]); delete rooms[r.code]; }
 }, 10 * 60e3);
 
 const PORT = process.env.PORT || 3000;

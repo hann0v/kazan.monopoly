@@ -4,7 +4,7 @@ const sock = io();
 const store = (k, v) => { try { return v === undefined ? sessionStorage[k] : (sessionStorage[k] = v); } catch { } };
 const ID = store('mid') || store('mid', Math.random().toString(36).slice(2, 12));
 
-let S = null, ROOM = null, NAME = '', modal = null, rolling = false, moveAt = 0, aucEnd = 0;
+let S = null, ROOM = null, NAME = '', modal = null, rolling = false, moveAt = 0, aucEnd = 0, turnEnd = 0;
 const shown = {}; // позиции фишек, которые сейчас нарисованы (для пошаговой анимации)
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -41,6 +41,7 @@ sock.on('err', m => float(esc(m), 'bad'));
 sock.on('state', s => {
   S = s;
   if (S.auction) aucEnd = Date.now() + S.auction.left;
+  turnEnd = S.turnLeft == null ? 0 : Date.now() + S.turnLeft;
   render();
 });
 sock.on('fx', onFx);
@@ -66,9 +67,10 @@ function render() {
   cells.forEach((d, i) => {
     const s = SQ[i], pr = S.props[i], o = pr && pl(pr.owner);
     d.classList.toggle('mort', !!pr?.mort);
+    d.classList.toggle('owned', !!o);
     d.style.setProperty('--o', o ? o.color : 'transparent');
     d.querySelector('small').innerHTML = pr
-      ? (pr.houses === 5 ? '<em class="h">■</em>' : '<em>' + '■'.repeat(pr.houses) + '</em>')
+      ? (pr.houses === 5 ? '<em class="h">★</em>' : pr.houses ? '<em>' + '■'.repeat(pr.houses) + '</em>' : esc(o.name))
       : s.price ? s.price + ' г' : s.amount ? '−' + s.amount + ' г' : '';
   });
   renderTokens(); renderCenter(me, t); renderSide();
@@ -81,7 +83,7 @@ function renderTokens() {
   for (const p of S.players) {
     if (shown[p.id] === undefined) shown[p.id] = p.pos;
     if (!p.bankrupt) cells[shown[p.id]].lastChild.insertAdjacentHTML('beforeend',
-      `<i class="tk${S.started && p === t ? ' cur' : ''}" style="background:${p.color}"></i>`);
+      `<i class="tk${S.started && p === t ? ' cur' : ''}" data-p="${p.id}" style="background:${p.color}"></i>`);
   }
 }
 
@@ -142,31 +144,39 @@ function renderCenter(me, t) {
         ${T.from === ID ? B('tradeCancel', 'Отменить') : ''}</div></div>`;
     }
     if (!t.online && t.id !== ID && me && !me.bankrupt) a += B('kick', `${esc(t.name)} не в сети — исключить`, `data-id="${t.id}"`);
-    if (me && !me.bankrupt) a += `<div class="row">${B('ui-trade', 'Обмен')}${B('ui-quit', 'Сдаться')}</div>`;
   }
   $('#status').innerHTML = st;
   $('#acts').innerHTML = a;
   const c = S.card;
   $('#cardbox').innerHTML = c && S.phase !== 'over'
     ? `<div class="cardmini ${c.g > 0 ? 'good' : c.g < 0 ? 'bad' : ''}">${c.deck === 'chance' ? 'Шанс' : 'Казна'} · ${esc(pl(c.who)?.name || '')}: ${esc(c.text)}</div>` : '';
-  tickAuction();
+  tick();
 }
 
-function tickAuction() {
+function tick() {
   const el = $('#aucT');
   if (el) el.textContent = Math.max(0, Math.ceil((aucEnd - Date.now()) / 1000)) + ' с';
+  const tm = $('#timer'), left = Math.max(0, turnEnd - Date.now());
+  tm.hidden = !turnEnd;
+  if (!turnEnd) return;
+  tm.firstChild.style.width = left / 300 + '%';
+  tm.lastChild.textContent = Math.ceil(left / 1000) + ' с';
+  tm.classList.toggle('low', left < 10000);
 }
-setInterval(tickAuction, 250);
+setInterval(tick, 250);
 
 function renderSide() {
   $('#players').innerHTML = S.players.map((p, k) => `
-    <div class="pl${S.started && k === S.turn ? ' on' : ''}${p.bankrupt ? ' out' : ''}">
+    <div data-id="${p.id}" class="pl${S.started && k === S.turn ? ' on' : ''}${p.bankrupt ? ' out' : ''}">
       <span class="m${p.money < 0 ? ' neg' : ''}">${gold(p.money)}</span>
       <i class="dot" style="background:${p.color}"></i><b>${esc(p.name)}</b>${p.id === ID ? ' <span class="mut">(вы)</span>' : ''}
       <div class="tags">${p.jail ? '🔒 в тюрьме ' : ''}${p.jailCards.length ? '🎫 ×' + p.jailCards.length + ' ' : ''}${!p.online ? 'не в сети ' : ''}${p.bankrupt ? 'банкрот' : ''}</div>
       <div class="chips">${Object.entries(S.props).filter(([, x]) => x.owner === p.id).map(([i, x]) =>
         `<i data-a="ui-prop" data-i="${i}" title="${esc(SQ[i].name)}" class="${x.mort ? 'mort' : ''}" style="background:${SQ[i].group ? GROUPS[SQ[i].group].c : '#8a8f99'}"></i>`).join('')}</div>
     </div>`).join('');
+  const me = pl(ID);
+  $('#tools').innerHTML = S.started && S.phase !== 'over' && me && !me.bankrupt
+    ? B('ui-trade', '⇄ Предложить обмен') + B('ui-quit', 'Сдаться', 'class="quiet"') : '';
   $('#log').innerHTML = S.log.slice().reverse().map(l => `<div>${esc(l)}</div>`).join('');
 }
 
@@ -299,10 +309,51 @@ function onFx(e) {
       if (e.hotel) { float(`${nm} строит отель!`, 'good'); coins(16); }
       break;
     case 'trade': float('Обмен состоялся', 'good'); break;
+    case 'pay': whenSettled(() => fly(e.from, e.to, e.amount)); break;
+    case 'timeout': banner(mine ? 'Время вышло!' : `${nm}: время вышло`, 'bad', '#ff5a5f', 1600); break;
     case 'bankrupt':
       banner(`${nm} — банкрот`, 'bad', '#ff5a5f', 2200);
       document.body.classList.add('gray'); setTimeout(() => document.body.classList.remove('gray'), 1200);
       break;
     case 'win': banner(`🏆 ${nm} побеждает!`, 'mono', '#f5c542', 6000); confetti(['#f5c542', '#ffffff', '#e63946', '#2ec4b6'], 160); break;
   }
+}
+
+// ---------- перелёт золота: кто кому платит ----------
+// Точка игрока — его фишка на поле, точка банка — надпись «КАЗАНЬ» в центре
+function anchor(id) {
+  if (!id) return $('#center h1');
+  return board.querySelector(`.tk[data-p="${id}"]`) || document.querySelector(`.pl[data-id="${id}"]`);
+}
+const mid = el => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+
+// ждём, пока фишки дошагают, чтобы золото летело из правильной клетки
+function whenSettled(cb, n = 0) {
+  const busy = rolling || Date.now() < moveAt || S.players.some(p => shown[p.id] !== undefined && shown[p.id] !== p.pos);
+  if (busy && n < 50) return setTimeout(() => whenSettled(cb, n + 1), 100);
+  cb();
+}
+
+function fly(from, to, amount) {
+  const a = anchor(from), b = anchor(to);
+  if (!a || !b) return;
+  const [x1, y1] = mid(a), [x2, y2] = mid(b);
+  const lift = Math.min(120, Math.hypot(x2 - x1, y2 - y1) / 3);
+  const pos = (x, y, s) => `translate(${x}px, ${y}px) translate(-50%, -50%) scale(${s})`;
+  const el = add(`<div class="fly${to === ID ? ' in' : from === ID ? ' out' : ''}">${gold(amount)}</div>`, 1600);
+  el.animate([
+    { transform: pos(x1, y1, .5), opacity: 0 },
+    { transform: pos(x1, y1 - 10, 1), opacity: 1, offset: .12 },
+    { transform: pos((x1 + x2) / 2, (y1 + y2) / 2 - lift, 1.15), offset: .55 },
+    { transform: pos(x2, y2, .9), opacity: 1, offset: .9 },
+    { transform: pos(x2, y2, .4), opacity: 0 },
+  ], { duration: 1400, easing: 'ease-in-out', fill: 'forwards' });
+  glow(from, '#ff5a5f', 0);
+  glow(to, '#f5c542', 1200);
+}
+
+function glow(id, color, delay) {
+  const el = id ? document.querySelector(`.pl[data-id="${id}"]`) : $('#center h1');
+  el?.animate([{ boxShadow: `0 0 0 0 ${color}00` }, { boxShadow: `0 0 0 3px ${color}, 0 0 22px ${color}` }, { boxShadow: `0 0 0 0 ${color}00` }],
+    { duration: 900, delay });
 }
