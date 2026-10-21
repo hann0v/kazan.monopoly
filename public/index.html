@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Монополия · Казань</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="lobby">
+    <h1>КАЗАНЬ</h1>
+    <p class="sub">монополия на золоте</p>
+    <input id="name" placeholder="Ваше имя" maxlength="16">
+    <button id="create" class="main">Создать комнату</button>
+    <input id="code" placeholder="Код комнаты" maxlength="6">
+    <button id="enter">Войти по коду</button>
+    <p class="mut">Валюта — граммы золота. Старт: 1,5 кг, Кремлёвская — 400 г.</p>
+  </div>
+
+  <div id="game" hidden>
+    <div id="board">
+      <div id="center">
+        <h1>КАЗАНЬ</h1>
+        <div class="sub">монополия на золоте</div>
+        <div id="dice"></div>
+        <div id="status"></div>
+        <div id="acts"></div>
+        <div id="cardbox"></div>
+      </div>
+    </div>
+    <aside id="side">
+      <div id="players"></div>
+      <div id="log"></div>
+    </aside>
+  </div>
+
+  <div id="modal" hidden></div>
+  <div id="fx"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="board.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>
